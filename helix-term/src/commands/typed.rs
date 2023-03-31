@@ -1220,7 +1220,8 @@ fn reload(
     doc.reload(view, &cx.editor.diff_providers, redraw_handle)
         .map(|_| {
             view.ensure_cursor_in_view(doc, scrolloff);
-        })
+        })?;
+    Ok(())
 }
 
 fn reload_all(

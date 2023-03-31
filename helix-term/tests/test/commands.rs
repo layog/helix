@@ -382,6 +382,32 @@ async fn test_character_info() -> anyhow::Result<()> {
         false,
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_persistent_undo() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let mut config = Config::default();
+    config.editor.persistent_undo = true;
+    let mut app = helpers::AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    // TODO: Test if the history file is valid.
+    test_key_sequence(
+        &mut app,
+        Some(&format!(
+            "ihello<esc>:w<ret>:bc!<ret>:o {}<ret>",
+            file.path().to_string_lossy()
+        )),
+        Some(&|app| {
+            assert!(!app.editor.is_err());
+        }),
+        false,
+    )
+    .await?;
 
     Ok(())
 }

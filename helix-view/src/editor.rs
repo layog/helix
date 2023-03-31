@@ -284,6 +284,8 @@ pub struct Config {
     pub soft_wrap: SoftWrap,
     /// Workspace specific lsp ceiling dirs
     pub workspace_lsp_roots: Vec<PathBuf>,
+
+    pub persistent_undo: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,6 +752,7 @@ impl Default for Config {
             text_width: 80,
             completion_replace: false,
             workspace_lsp_roots: Vec::new(),
+            persistent_undo: false,
         }
     }
 }
@@ -1313,6 +1316,9 @@ impl Editor {
                 Some(self.syn_loader.clone()),
                 self.config.clone(),
             )?;
+            if let Err(e) = doc.load_history() {
+                self.set_error(Cow::Owned(format!("failed to load history from disk: {e}")));
+            }
 
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
                 doc.set_diff_base(diff_base, self.redraw_handle.clone());

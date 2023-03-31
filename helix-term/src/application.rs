@@ -360,6 +360,21 @@ impl Application {
             // the Application can apply it.
             ConfigEvent::Update(editor_config) => {
                 let mut app_config = (*self.config.load().clone()).clone();
+                if !self.config.load().editor.persistent_undo && editor_config.persistent_undo {
+                    for doc in self.editor.documents_mut() {
+                        // HAXX: Do this so all revisions in this doc are treated as new.
+                        let lsr = doc.get_last_saved_revision();
+                        doc.set_last_saved_revision(0);
+                        if let Err(e) = doc.load_history() {
+                            doc.set_last_saved_revision(lsr);
+                            log::error!(
+                                "failed to reload history for {}: {e}",
+                                doc.path().unwrap().to_string_lossy()
+                            );
+                            return;
+                        }
+                    }
+                }
                 app_config.editor = *editor_config;
                 self.config.store(Arc::new(app_config));
             }
@@ -414,6 +429,19 @@ impl Application {
         let mut refresh_config = || -> Result<(), Error> {
             let default_config = Config::load_default()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
+
+            // Merge histories of existing docs if persistent undo was enabled.
+            if !self.config.load().editor.persistent_undo && default_config.editor.persistent_undo {
+                for doc in self.editor.documents_mut() {
+                    // HAXX: Do this so all revisions in this doc are treated as new.
+                    let lsr = doc.get_last_saved_revision();
+                    doc.set_last_saved_revision(0);
+                    if let Err(e) = doc.load_history() {
+                        doc.set_last_saved_revision(lsr);
+                        return Err(e);
+                    }
+                }
+            }
             self.refresh_language_config()?;
             self.refresh_theme(&default_config)?;
             // Store new config
@@ -500,7 +528,7 @@ impl Application {
         }
     }
 
-    pub fn handle_document_write(&mut self, doc_save_event: DocumentSavedEventResult) {
+    pub async fn handle_document_write(&mut self, doc_save_event: DocumentSavedEventResult) {
         let doc_save_event = match doc_save_event {
             Ok(event) => event,
             Err(err) => {
@@ -560,6 +588,9 @@ impl Application {
             lines,
             bytes
         ));
+        if doc_save_event.serialize_error {
+            self.editor.set_error("failed to serialize history");
+        }
     }
 
     #[inline(always)]
@@ -568,7 +599,7 @@ impl Application {
 
         match event {
             EditorEvent::DocumentSaved(event) => {
-                self.handle_document_write(event);
+                self.handle_document_write(event).await;
                 self.render().await;
             }
             EditorEvent::ConfigEvent(event) => {

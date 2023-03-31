@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
+use tokio::fs::OpenOptions;
 
 use helix_core::{
     encoding,
@@ -103,6 +104,7 @@ pub struct DocumentSavedEvent {
     pub doc_id: DocumentId,
     pub path: PathBuf,
     pub text: Rope,
+    pub serialize_error: bool,
 }
 
 pub type DocumentSavedEventResult = Result<DocumentSavedEvent, anyhow::Error>;
@@ -687,7 +689,14 @@ impl Document {
         let encoding = self.encoding;
 
         let last_saved_time = self.last_saved_time;
-
+        let history = self
+            .config
+            .load()
+            .persistent_undo
+            .then(|| self.history.get_mut().clone())
+            .filter(|history| !history.is_empty());
+        let undofile_path = self.undo_file(Some(&path))?.unwrap();
+        let last_saved_revision = self.get_last_saved_revision();
         // We encode the file according to the `Document`'s encoding.
         let future = async move {
             use tokio::{fs, fs::File};
@@ -716,11 +725,55 @@ impl Document {
             let mut file = File::create(&path).await?;
             to_writer(&mut file, encoding, &text).await?;
 
+            let mut serialize_error = false;
+            if let Some(history) = history {
+                let res = {
+                    let path = path.clone();
+                    let mut undofile = OpenOptions::new()
+                        .write(true)
+                        .read(true)
+                        .create(true)
+                        .open(&undofile_path)
+                        .await?
+                        .into_std()
+                        .await;
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        // Truncate the file if it's not a valid undofile.
+                        let offset = if History::deserialize(
+                            &mut std::fs::File::open(&undofile_path)?,
+                            &path,
+                        )
+                        .is_ok()
+                        {
+                            log::info!("Overwriting undofile for {}", path.to_string_lossy());
+                            undofile.set_len(0)?;
+                            0
+                        } else {
+                            last_saved_revision
+                        };
+                        history.serialize(&mut undofile, &path, current_rev, offset)?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| anyhow!(e))
+                    .and_then(std::convert::identity)
+                };
+
+                if let Err(e) = res {
+                    log::error!(
+                        "Failed to serialize history for {}: {e}",
+                        path.to_string_lossy()
+                    );
+                    serialize_error = true;
+                }
+            };
+
             let event = DocumentSavedEvent {
                 revision: current_rev,
                 doc_id,
                 path,
                 text: text.clone(),
+                serialize_error,
             };
 
             if let Some(language_server) = language_server {
@@ -782,14 +835,17 @@ impl Document {
         let mut file = std::fs::File::open(&path)?;
         let (rope, ..) = from_reader(&mut file, Some(encoding))?;
 
-        // Calculate the difference between the buffer and source text, and apply it.
-        // This is not considered a modification of the contents of the file regardless
-        // of the encoding.
-        let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
-        self.apply(&transaction, view.id);
-        self.append_changes_to_history(view);
-        self.reset_modified();
-
+        let e = self.load_history().map_err(|e| {
+            log::error!("{}", e);
+            // Calculate the difference between the buffer and source text, and apply it.
+            // This is not considered a modification of the contents of the file regardless
+            // of the encoding.
+            let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
+            self.apply(&transaction, view.id);
+            self.append_changes_to_history(view);
+            self.reset_modified();
+            e
+        });
         self.last_saved_time = SystemTime::now();
 
         self.detect_indent_and_line_ending();
@@ -801,6 +857,45 @@ impl Document {
 
         self.version_control_head = provider_registry.get_current_head_name(&path);
 
+        e
+    }
+
+    pub fn undo_file(&self, path: Option<&PathBuf>) -> anyhow::Result<Option<PathBuf>> {
+        let undo_dir = helix_loader::cache_dir().join("undo");
+        std::fs::create_dir_all(&undo_dir)?;
+        let res = self.path().or(path).map(|path| {
+            let escaped_path = helix_core::path::escape_path(path);
+            undo_dir.join(escaped_path)
+        });
+        Ok(res)
+    }
+
+    pub fn load_history(&mut self) -> anyhow::Result<()> {
+        if !self.config.load().persistent_undo {
+            return Ok(());
+        }
+
+        if let Some(mut undo_file) = self
+            .undo_file(None)?
+            .and_then(|path| std::fs::File::open(path).ok())
+        {
+            if undo_file.metadata()?.len() != 0 {
+                let (last_saved_revision, history) = helix_core::history::History::deserialize(
+                    &mut undo_file,
+                    self.path().unwrap(),
+                )?;
+
+                if self.history.get_mut().is_empty()
+                    || self.get_current_revision() == last_saved_revision
+                {
+                    self.history.set(history);
+                } else {
+                    let offset = self.get_last_saved_revision() + 1;
+                    self.history.get_mut().merge(history, offset)?;
+                }
+                self.set_last_saved_revision(last_saved_revision);
+            }
+        }
         Ok(())
     }
 
@@ -1208,7 +1303,7 @@ impl Document {
     }
 
     /// Get the document's latest saved revision.
-    pub fn get_last_saved_revision(&mut self) -> usize {
+    pub fn get_last_saved_revision(&self) -> usize {
         self.last_saved_revision
     }
 
@@ -1533,9 +1628,8 @@ impl Display for FormatterError {
 
 #[cfg(test)]
 mod test {
-    use arc_swap::ArcSwap;
-
     use super::*;
+    use arc_swap::ArcSwap;
 
     #[test]
     fn changeset_to_changes_ignore_line_endings() {
@@ -1701,6 +1795,131 @@ mod test {
                 .to_string(),
             DEFAULT_LINE_ENDING.as_str()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_history() {
+        let test_fn: fn(Vec<String>) -> bool = |changes| -> bool {
+            // Divide the vec into 3 sets of changes.
+            let len = changes.len() / 3;
+            let mut original = Rope::new();
+            let mut iter = changes.into_iter();
+
+            let changes_a: Vec<_> = iter
+                .by_ref()
+                .take(len)
+                .map(|c| {
+                    let c = Rope::from(c);
+                    let transaction = helix_core::diff::compare_ropes(&original, &c);
+                    original = c;
+                    transaction
+                })
+                .collect();
+            let mut original_concurrent = original.clone();
+
+            let changes_b: Vec<_> = iter
+                .by_ref()
+                .take(len)
+                .map(|c| {
+                    let c = Rope::from(c);
+                    let transaction = helix_core::diff::compare_ropes(&original, &c);
+                    original = c;
+                    transaction
+                })
+                .collect();
+            let changes_c: Vec<_> = iter
+                .take(len)
+                .map(|c| {
+                    let c = Rope::from(c);
+                    let transaction = helix_core::diff::compare_ropes(&original_concurrent, &c);
+                    original_concurrent = c;
+                    transaction
+                })
+                .collect();
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let config = Config {
+                persistent_undo: true,
+                ..Default::default()
+            };
+
+            let view_id = ViewId::default();
+            let config = Arc::new(ArcSwap::new(Arc::new(config)));
+            let mut doc_1 = Document::open(file.path(), None, None, config.clone()).unwrap();
+            doc_1.ensure_view_init(view_id);
+
+            // Make changes & save document A
+            for c in changes_a {
+                doc_1.apply(&c, view_id);
+            }
+            helix_lsp::block_on(doc_1.save::<PathBuf>(None, true).unwrap()).unwrap();
+
+            let mut doc_2 = Document::open(file.path(), None, None, config.clone()).unwrap();
+            let mut doc_3 = Document::open(file.path(), None, None, config.clone()).unwrap();
+            doc_2.ensure_view_init(view_id);
+            doc_3.ensure_view_init(view_id);
+
+            // Make changes in A and B at the same time.
+            for c in changes_b {
+                doc_1.apply(&c, view_id);
+            }
+            for c in changes_c {
+                doc_2.apply(&c, view_id);
+            }
+            helix_lsp::block_on(doc_2.save::<PathBuf>(None, true).unwrap()).unwrap();
+
+            doc_1.load_history().unwrap();
+            doc_3.load_history().unwrap();
+
+            // doc_3 had no diverging edits, so they should be the same.
+            assert_eq!(doc_2.history.get_mut(), doc_3.history.get_mut());
+
+            helix_lsp::block_on(doc_1.save::<PathBuf>(None, true).unwrap()).unwrap();
+            doc_2.load_history().unwrap();
+            doc_3.load_history().unwrap();
+
+            let _ = Document::open(file.path(), None, None, config).unwrap();
+            doc_1.history.get_mut() == doc_2.history.get_mut()
+                && doc_1.history.get_mut() == doc_3.history.get_mut()
+        };
+        let handles: Vec<_> = (0..100)
+            .map(|_| {
+                tokio::task::spawn_blocking(move || {
+                    quickcheck::QuickCheck::new()
+                        .max_tests(1)
+                        .quickcheck(test_fn);
+                })
+            })
+            .collect();
+        futures_util::future::try_join_all(handles).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn save_history() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let config = Config {
+            persistent_undo: true,
+            ..Default::default()
+        };
+
+        let view_id = ViewId::default();
+        let config = Arc::new(ArcSwap::new(Arc::new(config)));
+        let mut doc = Document::open(file.path(), None, None, config.clone()).unwrap();
+
+        let tx = Transaction::change(&Rope::new(), [(0, 0, None)].into_iter());
+        doc.apply(&tx, view_id);
+        doc.save::<PathBuf>(None, false).unwrap().await.unwrap();
+
+        // Wipe undo file
+        tokio::fs::File::create(doc.undo_file(None).unwrap().unwrap())
+            .await
+            .unwrap();
+
+        // Write it again.
+        doc.save::<PathBuf>(None, false).unwrap().await.unwrap();
+
+        // Will load history.
+        Document::open(file.path(), None, None, config.clone()).unwrap();
     }
 
     macro_rules! decode {
